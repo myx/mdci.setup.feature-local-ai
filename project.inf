@@ -1,0 +1,30 @@
+Name: setup.feature-local-ai
+Info: optional local AI on a machine: speech-to-text (whisper.cpp) and chat models (llama.cpp), each part installed and removed on its own
+Requires: \
+	
+
+Provides: \
+	standard/setup.feature-local-ai \
+	\
+	image-install:context-variable:MDCI_LOCAL_AI_PROFILE:create:shared-cpu \
+	image-install:context-variable:MDCI_LOCAL_AI_PARTS:create: \
+	image-install:context-variable:MDCI_LOCAL_AI_REMOVE:create: \
+	image-install:context-variable:MDCI_LOCAL_AI_CHAT_ADDR:create:127.0.0.1:8181 \
+	image-install:context-variable:MDCI_LOCAL_AI_STT_ADDR:create:127.0.0.1:8182 \
+	\
+	image-prepare:sync-source-files:*:data/local-ai:local-ai \
+	image-install:deploy-sync-files:local-ai:/usr/local/mdci-files/local-ai \
+	\
+	image-install:exec-update-before:host/install/feature-local-ai.0.uninstall.txt \
+	image-install:exec-update-before:host/install/feature-local-ai.1.install.txt \
+	image-install:exec-update-after:host/install/feature-local-ai.2.check.txt \
+	\
+
+Keywords: \
+	local-ai \
+	llm \
+	whisper \
+	stt \
+	deploy.local-ai \
+
+Includes: 

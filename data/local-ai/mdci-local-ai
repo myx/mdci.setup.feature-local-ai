@@ -1,0 +1,1012 @@
+#!/bin/sh
+#
+# mdci-local-ai -- manage the local AI parts of a machine: install, uninstall,
+# check, serve. Parts: stt (whisper.cpp), chat-engine (llama.cpp), chat models.
+# Data lives in one fixed folder, LAI_DATA, never in a home folder.
+
+set -u
+
+LAI_DATA=/var/db/mdci-local-ai
+LAI_STAGE="${MDCI_FILES_PATH:-/usr/local/mdci-files}/local-ai"
+LAI_USER=mdci-ai
+LAI_UID=583
+LAI_RCDIR=/usr/local/etc/rc.d
+LAI_BIN=/usr/local/sbin/mdci-local-ai
+LAI_OS=$(uname -s)
+
+LAI_SRC="$LAI_STAGE"
+if [ -d "$(dirname "$0")/rc.d" ]; then
+	LAI_SRC=$(cd "$(dirname "$0")" && pwd)
+fi
+LAI_MF="$LAI_DATA/manifest.tsv"
+[ -f "$LAI_MF" ] || LAI_MF="$LAI_SRC/models.tsv"
+
+say() { printf '%s\n' "local-ai: $*" ; }
+warn() { printf '%s\n' "🙋 WARNING: local-ai: $*" >&2 ; }
+die() { printf '%s\n' "⛔ ERROR: local-ai: $*" >&2 ; exit 1 ; }
+kv() { printf '%s: %s\n' "$1" "$2" ; }
+
+[ "$(uname -s)" != "" ] || die "uname failed"
+
+#
+# configuration
+#
+
+conf_load() {
+	LAI_PROFILE=shared-cpu
+	LAI_CHAT_ADDR=127.0.0.1:8181
+	LAI_STT_ADDR=127.0.0.1:8182
+	LAI_CHAT_ARGS=
+	LAI_STT_ARGS=
+	LAI_STT_MODEL=
+	if [ -f "$LAI_DATA/local-ai.conf" ] ; then
+		. "$LAI_DATA/local-ai.conf"
+	fi
+}
+
+addr_check() {
+	case "$1" in
+		127.0.0.1:[0-9]*|\[::1\]:[0-9]*) ;;
+		*) die "address $1 is not loopback (127.0.0.1:PORT or [::1]:PORT)" ;;
+	esac
+}
+
+conf_write() {
+	conf_load
+	LAI_PROFILE="${MDCI_LOCAL_AI_PROFILE:-$LAI_PROFILE}"
+	LAI_CHAT_ADDR="${MDCI_LOCAL_AI_CHAT_ADDR:-$LAI_CHAT_ADDR}"
+	LAI_STT_ADDR="${MDCI_LOCAL_AI_STT_ADDR:-$LAI_STT_ADDR}"
+	case "$LAI_PROFILE" in
+		shared-cpu|big-cpu|gpu) ;;
+		*) die "profile must be shared-cpu, big-cpu or gpu, not $LAI_PROFILE" ;;
+	esac
+	addr_check "$LAI_CHAT_ADDR"
+	addr_check "$LAI_STT_ADDR"
+	cat > "$LAI_DATA/local-ai.conf.new" <<- EOF
+		LAI_PROFILE="$LAI_PROFILE"
+		LAI_CHAT_ADDR="$LAI_CHAT_ADDR"
+		LAI_STT_ADDR="$LAI_STT_ADDR"
+		LAI_CHAT_ARGS="$LAI_CHAT_ARGS"
+		LAI_STT_ARGS="$LAI_STT_ARGS"
+		LAI_STT_MODEL="$LAI_STT_MODEL"
+	EOF
+	chmod 644 "$LAI_DATA/local-ai.conf.new"
+	mv "$LAI_DATA/local-ai.conf.new" "$LAI_DATA/local-ai.conf"
+}
+
+#
+# host facts
+#
+
+host_cpus() {
+	sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 1
+}
+
+host_ram() {
+	case "$LAI_OS" in
+		FreeBSD) sysctl -n hw.physmem ;;
+		Darwin) sysctl -n hw.memsize ;;
+		*) awk '/^MemTotal:/{print $2*1024}' /proc/meminfo 2>/dev/null || echo 0 ;;
+	esac
+}
+
+host_free() {
+	hf_dir="$LAI_DATA"
+	while [ ! -d "$hf_dir" ] ; do hf_dir=$(dirname "$hf_dir") ; done
+	df -Pk "$hf_dir" | awk 'NR==2{print $4*1024}'
+}
+
+human() {
+	awk -v b="$1" 'BEGIN{ if (b>=1073741824) printf "%.1f GB", b/1073741824; else printf "%.0f MB", b/1048576 }'
+}
+
+sha256_of() {
+	if command -v sha256 >/dev/null 2>&1 ; then
+		sha256 -q "$1"
+	elif command -v sha256sum >/dev/null 2>&1 ; then
+		sha256sum "$1" | awk '{print $1}'
+	else
+		shasum -a 256 "$1" | awk '{print $1}'
+	fi
+}
+
+#
+# manifest: id part family params quant profiles file size sha256 url
+#
+
+mf() {
+	[ -f "$LAI_MF" ] || die "manifest not found: $LAI_MF"
+	awk -F'\t' '$0 !~ /^#/ && NF >= 10' "$LAI_MF"
+}
+
+mf_field() {
+	mf | awk -F'\t' -v id="$1" -v n="$2" '$1==id{print $n; exit}'
+}
+
+mf_ids() {
+	mf | awk -F'\t' -v p="${1:-}" 'p=="" || $2==p {print $1}'
+}
+
+mf_default() {
+	mf | awk -F'\t' -v p="$1" -v pr="$2" '$2==p { n=split($6,a,","); for(i=1;i<=n;i++) if (a[i]==pr"*") { print $1; exit } }'
+}
+
+part_dir() {
+	case "$1" in
+		chat) echo "$LAI_DATA/models" ;;
+		stt) echo "$LAI_DATA/stt" ;;
+		*) die "unknown part $1" ;;
+	esac
+}
+
+model_path() {
+	mp_part=$(mf_field "$1" 2)
+	[ -n "$mp_part" ] || die "unknown model: $1"
+	echo "$(part_dir "$mp_part")/$(mf_field "$1" 7)"
+}
+
+is_installed() {
+	[ -f "$LAI_DATA/state/$1.ok" ] && [ -f "$(model_path "$1")" ]
+}
+
+installed_ids() {
+	for ii_id in $(mf_ids "${1:-}") ; do
+		if is_installed "$ii_id" ; then echo "$ii_id" ; fi
+	done
+}
+
+#
+# packages and services
+#
+
+pkg_name() {
+	case "$LAI_OS:$1" in
+		FreeBSD:chat) echo llama-cpp ;;
+		FreeBSD:stt) echo whisper.cpp ;;
+		Darwin:chat) echo llama.cpp ;;
+		Darwin:stt) echo whisper.cpp ;;
+		*) die "no package known for $1 on $LAI_OS" ;;
+	esac
+}
+
+pkg_add() {
+	pa_name=$(pkg_name "$1")
+	case "$LAI_OS" in
+		FreeBSD) pkg install -y "$pa_name" ;;
+		Darwin)
+			pa_brew=$(command -v brew || echo /opt/homebrew/bin/brew)
+			if [ "$(id -u)" = 0 ] ; then
+				[ -n "${SUDO_USER:-}" ] || die "brew refuses root: run as the owner of Homebrew, or with sudo"
+				sudo -u "$SUDO_USER" "$pa_brew" install "$pa_name"
+			else
+				"$pa_brew" install "$pa_name"
+			fi
+			;;
+	esac
+}
+
+pkg_del() {
+	pd_name=$(pkg_name "$1")
+	case "$LAI_OS" in
+		FreeBSD) pkg delete -y "$pd_name" ;;
+		Darwin)
+			pd_brew=$(command -v brew || echo /opt/homebrew/bin/brew)
+			if [ "$(id -u)" = 0 ] && [ -n "${SUDO_USER:-}" ] ; then
+				sudo -u "$SUDO_USER" "$pd_brew" uninstall "$pd_name"
+			else
+				"$pd_brew" uninstall "$pd_name"
+			fi
+			;;
+	esac
+}
+
+engine_bin() {
+	case "$1" in
+		chat) echo llama-server ;;
+		stt) echo whisper-server ;;
+	esac
+}
+
+engine_present() {
+	command -v "$(engine_bin "$1")" >/dev/null 2>&1
+}
+
+svc_name() {
+	case "$1" in
+		chat) echo mdci_ai_chat ;;
+		stt) echo mdci_ai_stt ;;
+	esac
+}
+
+svc_install() {
+	if [ "$LAI_OS" != FreeBSD ] ; then
+		say "service:$1: not managed on $LAI_OS, run: $LAI_BIN serve $1"
+		return 0
+	fi
+	si_sv=$(svc_name "$1")
+	install -m 555 "$LAI_SRC/rc.d/$si_sv" "$LAI_RCDIR/$si_sv"
+	sysrc -q "${si_sv}_enable=YES" >/dev/null
+}
+
+svc_start() {
+	[ "$LAI_OS" = FreeBSD ] || return 0
+	service "$(svc_name "$1")" restart
+}
+
+svc_stop() {
+	[ "$LAI_OS" = FreeBSD ] || return 0
+	service "$(svc_name "$1")" onestop >/dev/null 2>&1 || :
+}
+
+svc_remove() {
+	[ "$LAI_OS" = FreeBSD ] || return 0
+	sr_sv=$(svc_name "$1")
+	service "$sr_sv" onestop >/dev/null 2>&1 || :
+	sysrc -q -x "${sr_sv}_enable" >/dev/null 2>&1 || :
+	rm -f "$LAI_RCDIR/$sr_sv"
+}
+
+svc_running() {
+	[ "$LAI_OS" = FreeBSD ] || return 1
+	service "$(svc_name "$1")" onestatus >/dev/null 2>&1
+}
+
+#
+# setup, refresh
+#
+
+cmd_setup() {
+	[ "$(id -u)" = 0 ] || die "setup: must be root"
+	mkdir -p "$LAI_DATA" "$LAI_DATA/models" "$LAI_DATA/stt" "$LAI_DATA/state" "$LAI_DATA/cache" "$LAI_DATA/run"
+	chmod 755 "$LAI_DATA" "$LAI_DATA/models" "$LAI_DATA/stt" "$LAI_DATA/state"
+	if [ "$LAI_OS" = FreeBSD ] ; then
+		pw groupshow "$LAI_USER" >/dev/null 2>&1 || pw groupadd "$LAI_USER" -g "$LAI_UID"
+		pw usershow "$LAI_USER" >/dev/null 2>&1 || pw useradd "$LAI_USER" -u "$LAI_UID" -g "$LAI_USER" -d /nonexistent -s /usr/sbin/nologin -c "MDCI local AI service user"
+		chown "$LAI_USER:$LAI_USER" "$LAI_DATA/cache" "$LAI_DATA/run"
+		chmod 750 "$LAI_DATA/cache" "$LAI_DATA/run"
+	fi
+	if [ -f "$LAI_SRC/models.tsv" ] ; then
+		install -m 644 "$LAI_SRC/models.tsv" "$LAI_DATA/manifest.tsv"
+		LAI_MF="$LAI_DATA/manifest.tsv"
+	fi
+	mkdir -p "$(dirname "$LAI_BIN")"
+	if [ -f "$LAI_SRC/mdci-local-ai" ] ; then
+		install -m 755 "$LAI_SRC/mdci-local-ai" "$LAI_BIN"
+	fi
+	conf_write
+	cmd_refresh
+}
+
+probe_chat() {
+	conf_load
+	curl -fsS --max-time 3 -o /dev/null "http://$LAI_CHAT_ADDR/health" 2>/dev/null
+}
+
+probe_stt() {
+	conf_load
+	curl -sS --max-time 3 -o /dev/null "http://$LAI_STT_ADDR/" 2>/dev/null
+}
+
+part_state() {
+	# prints absent, stopped or running
+	if ! engine_present "$1" ; then echo absent ; return 0 ; fi
+	if "probe_$1" ; then echo running ; else echo stopped ; fi
+}
+
+json_models() {
+	jm_first=1
+	for jm_id in $(installed_ids) ; do
+		[ "$jm_first" = 1 ] || printf ',\n'
+		jm_first=0
+		printf '    {"id":"%s","part":"%s","family":"%s","params":"%s","quant":"%s","file":"%s","path":"%s","size_bytes":%s,"sha256":"%s","profiles":"%s","installed":true}' \
+			"$jm_id" "$(mf_field "$jm_id" 2)" "$(mf_field "$jm_id" 3)" "$(mf_field "$jm_id" 4)" "$(mf_field "$jm_id" 5)" \
+			"$(mf_field "$jm_id" 7)" "$(model_path "$jm_id")" "$(mf_field "$jm_id" 8)" "$(mf_field "$jm_id" 9)" "$(mf_field "$jm_id" 6)"
+	done
+	printf '\n'
+}
+
+json_available() {
+	ja_first=1
+	for ja_id in $(mf_ids) ; do
+		is_installed "$ja_id" && continue
+		[ "$ja_first" = 1 ] || printf ',\n'
+		ja_first=0
+		printf '    {"id":"%s","part":"%s","size_bytes":%s,"profiles":"%s"}' \
+			"$ja_id" "$(mf_field "$ja_id" 2)" "$(mf_field "$ja_id" 8)" "$(mf_field "$ja_id" 6)"
+	done
+	printf '\n'
+}
+
+cmd_refresh() {
+	[ -d "$LAI_DATA" ] || die "refresh: $LAI_DATA does not exist, run setup"
+	conf_load
+	rf_ini="$LAI_DATA/models.ini.new"
+	: > "$rf_ini"
+	for rf_id in $(installed_ids chat) ; do
+		printf '[%s]\nmodel = %s\n\n' "$rf_id" "$(model_path "$rf_id")" >> "$rf_ini"
+	done
+	chmod 644 "$rf_ini"
+	mv "$rf_ini" "$LAI_DATA/models.ini"
+	rf_json="$LAI_DATA/models.json.new"
+	{
+		printf '{\n'
+		printf '  "schema": "mdci-local-ai/1",\n'
+		printf '  "data": "%s",\n' "$LAI_DATA"
+		printf '  "profile": "%s",\n' "$LAI_PROFILE"
+		printf '  "endpoints": {\n'
+		printf '    "chat": {"url":"http://%s/v1","health":"http://%s/health","api":"openai","state":"%s"},\n' "$LAI_CHAT_ADDR" "$LAI_CHAT_ADDR" "$(part_state chat)"
+		printf '    "stt": {"url":"http://%s/inference","api":"whisper-server","state":"%s"}\n' "$LAI_STT_ADDR" "$(part_state stt)"
+		printf '  },\n'
+		printf '  "models": [\n'
+		json_models
+		printf '  ],\n'
+		printf '  "available": [\n'
+		json_available
+		printf '  ]\n'
+		printf '}\n'
+	} > "$rf_json"
+	chmod 644 "$rf_json"
+	mv "$rf_json" "$LAI_DATA/models.json"
+}
+
+#
+# download
+#
+
+dl_model() {
+	dm_id="$1"
+	dm_part=$(mf_field "$dm_id" 2)
+	[ -n "$dm_part" ] || die "install: unknown model $dm_id"
+	if is_installed "$dm_id" ; then
+		say "install:$dm_id: already present"
+		return 0
+	fi
+	dm_file=$(mf_field "$dm_id" 7)
+	dm_size=$(mf_field "$dm_id" 8)
+	dm_sha=$(mf_field "$dm_id" 9)
+	dm_url=$(mf_field "$dm_id" 10)
+	dm_dest="$(part_dir "$dm_part")/$dm_file"
+	if [ "$dm_part" = chat ] && [ "$LAI_FORCE" != 1 ] ; then
+		dm_need=$(( dm_size + dm_size / 6 ))
+		[ "$(host_ram)" -ge "$dm_need" ] || die "install:$dm_id: needs about $(human "$dm_need") of RAM, host has $(human "$(host_ram)"); use --force to override"
+	fi
+	say "install:$dm_id: downloading $(human "$dm_size") to $dm_dest"
+	dm_have=0
+	[ -f "$dm_dest.part" ] && dm_have=$(wc -c < "$dm_dest.part" | tr -d ' ')
+	if [ "$dm_have" != "$dm_size" ] ; then
+		dm_prog=-sS
+		[ -t 2 ] && dm_prog=--progress-bar
+		curl -fL --proto '=https' --retry 3 --retry-delay 5 -C - $dm_prog -o "$dm_dest.part" "$dm_url" || die "install:$dm_id: download failed (partial file kept for resume)"
+	fi
+	dm_got=$(sha256_of "$dm_dest.part")
+	if [ "$dm_got" != "$dm_sha" ] ; then
+		rm -f "$dm_dest.part"
+		die "install:$dm_id: checksum mismatch (got $dm_got, manifest $dm_sha)"
+	fi
+	chmod 644 "$dm_dest.part"
+	mv "$dm_dest.part" "$dm_dest"
+	printf '%s\n' "$dm_sha" > "$LAI_DATA/state/$dm_id.ok"
+	say "install:$dm_id: verified sha256"
+}
+
+#
+# tokens -> items
+#
+
+expand_tokens() {
+	conf_load
+	for et_t in "$@" ; do
+		case "$et_t" in
+			stt)
+				echo eng:stt
+				echo "model:${LAI_STT_MODEL:-$(mf_default stt all)}"
+				;;
+			stt-engine) echo eng:stt ;;
+			chat-engine) echo eng:chat ;;
+			chat)
+				echo eng:chat
+				echo "model:$(mf_default chat "$LAI_PROFILE")"
+				;;
+			*) echo "model:$et_t" ;;
+		esac
+	done | awk '!seen[$0]++'
+}
+
+#
+# state of a model, and plans in key: value lines (what tooling reads)
+#
+
+# model_state <id>: installed, not installed, or broken|<why>
+model_state() {
+	ms_path=$(model_path "$1")
+	ms_ok=0
+	ms_file=0
+	[ -f "$LAI_DATA/state/$1.ok" ] && ms_ok=1
+	[ -f "$ms_path" ] && ms_file=1
+	case "$ms_ok$ms_file" in
+		11)
+			if [ "$(wc -c < "$ms_path" | tr -d ' ')" = "$(mf_field "$1" 8)" ] ; then echo installed ; else echo "broken|the file size differs from the manifest" ; fi
+			;;
+		10) echo "broken|the file is missing" ;;
+		01) echo "broken|the file has no verified marker" ;;
+		*) echo "not installed" ;;
+	esac
+}
+
+# model_memory <id>: the memory the model needs when it runs, an estimate: a chat model the way install checks it, a speech model its file
+model_memory() {
+	mm_size=$(mf_field "$1" 8)
+	case "$(mf_field "$1" 2)" in
+		chat) echo $(( mm_size + mm_size / 6 )) ;;
+		*) echo "$mm_size" ;;
+	esac
+}
+
+# plan_install <items>: what install would do, and whether it can, as key: value lines; nothing is changed
+plan_install() {
+	pi_total=0
+	pi_need=0
+	pi_why=
+	kv plan.action install
+	for pi_i in $1 ; do
+		case "$pi_i" in
+			eng:*)
+				pi_p="${pi_i#eng:}"
+				if engine_present "$pi_p" ; then kv plan.present "engine $pi_p" ; else kv plan.package "$(pkg_name "$pi_p")" ; fi
+				;;
+			model:*)
+				pi_id="${pi_i#model:}"
+				if [ -z "$(mf_field "$pi_id" 2)" ] ; then pi_why="unknown model $pi_id" ; continue ; fi
+				if is_installed "$pi_id" ; then
+					kv plan.present "model $pi_id"
+				else
+					pi_sz=$(mf_field "$pi_id" 8)
+					pi_total=$(( pi_total + pi_sz ))
+					kv plan.model "$pi_id $pi_sz"
+					if [ "$(mf_field "$pi_id" 2)" = chat ] && [ "$(model_memory "$pi_id")" -gt "$pi_need" ] ; then pi_need=$(model_memory "$pi_id") ; fi
+				fi
+				;;
+		esac
+	done
+	kv plan.download_bytes "$pi_total"
+	kv plan.free_bytes "$(host_free)"
+	kv plan.ram_bytes "$(host_ram)"
+	kv plan.ram_need_bytes "$pi_need"
+	if [ -z "$pi_why" ] && [ "$(host_free)" -le "$pi_total" ] ; then pi_why="not enough free space in $LAI_DATA" ; fi
+	if [ -z "$pi_why" ] && [ "$LAI_FORCE" != 1 ] && [ "$pi_need" -gt "$(host_ram)" ] ; then pi_why="a chat model needs about $(human "$pi_need") of RAM, the host has $(human "$(host_ram)")" ; fi
+	if [ -n "$pi_why" ] ; then kv plan.blocked yes ; kv plan.why "$pi_why" ; else kv plan.blocked no ; fi
+}
+
+# plan_uninstall <tokens>: what uninstall would remove, as key: value lines; nothing is changed
+plan_uninstall() {
+	pu_total=0
+	kv plan.action uninstall
+	for pu_t in "$@" ; do
+		pu_models=
+		case "$pu_t" in
+			stt)
+				engine_present stt && kv plan.package "$(pkg_name stt)"
+				pu_models=$(mf_ids stt)
+				;;
+			chat-engine)
+				engine_present chat && kv plan.package "$(pkg_name chat)"
+				;;
+			chat)
+				engine_present chat && kv plan.package "$(pkg_name chat)"
+				pu_models=$(mf_ids chat)
+				;;
+			all-chat-models) pu_models=$(mf_ids chat) ;;
+			*)
+				[ -n "$(mf_field "$pu_t" 2)" ] || die "uninstall: unknown part or model $pu_t"
+				pu_models="$pu_t"
+				;;
+		esac
+		for pu_id in $pu_models ; do
+			pu_path=$(model_path "$pu_id")
+			pu_sz=0
+			[ -f "$pu_path" ] && pu_sz=$(wc -c < "$pu_path" | tr -d ' ')
+			[ -f "$pu_path.part" ] && pu_sz=$(( pu_sz + $(wc -c < "$pu_path.part" | tr -d ' ') ))
+			if [ -f "$pu_path" ] || [ -f "$pu_path.part" ] || [ -f "$LAI_DATA/state/$pu_id.ok" ] ; then
+				kv plan.remove "$pu_id $pu_sz"
+				pu_total=$(( pu_total + pu_sz ))
+			fi
+		done
+	done
+	kv plan.reclaim_bytes "$pu_total"
+	kv plan.free_bytes "$(host_free)"
+	kv plan.blocked no
+}
+
+cmd_install() {
+	LAI_FORCE=0
+	ci_dry=0
+	ci_parse=0
+	ci_tokens=
+	for ci_a in "$@" ; do
+		case "$ci_a" in
+			--dry-run) ci_dry=1 ;;
+			--parse) ci_dry=1 ; ci_parse=1 ;;
+			--force) LAI_FORCE=1 ;;
+			-*) die "install: unknown option $ci_a" ;;
+			*) ci_tokens="$ci_tokens $ci_a" ;;
+		esac
+	done
+	[ -n "$ci_tokens" ] || die "install: name a part: stt, chat-engine, chat, or a model id (see: parts)"
+	# shellcheck disable=SC2086
+	ci_items=$(expand_tokens $ci_tokens)
+	if [ "$ci_parse" = 1 ] ; then
+		plan_install "$ci_items"
+		return 0
+	fi
+	ci_total=0
+	for ci_i in $ci_items ; do
+		case "$ci_i" in
+			eng:*) say "plan: package $(pkg_name "${ci_i#eng:}") and its service" ;;
+			model:*)
+				ci_id="${ci_i#model:}"
+				[ -n "$(mf_field "$ci_id" 2)" ] || die "install: unknown model $ci_id"
+				if is_installed "$ci_id" ; then
+					say "plan: $ci_id already present"
+				else
+					ci_sz=$(mf_field "$ci_id" 8)
+					ci_total=$(( ci_total + ci_sz ))
+					say "plan: model $ci_id, $(human "$ci_sz")"
+				fi
+				;;
+		esac
+	done
+	say "plan: download total $(human "$ci_total"), free in $LAI_DATA: $(human "$(host_free)"), host RAM: $(human "$(host_ram)")"
+	[ "$ci_dry" = 1 ] && return 0
+	[ "$(host_free)" -gt "$ci_total" ] || die "install: not enough free space in $LAI_DATA"
+	cmd_setup
+	for ci_i in $ci_items ; do
+		case "$ci_i" in
+			eng:*)
+				ci_p="${ci_i#eng:}"
+				if engine_present "$ci_p" ; then say "install:$ci_p: engine already present" ; else pkg_add "$ci_p" || die "install:$ci_p: package install failed" ; fi
+				svc_install "$ci_p"
+				;;
+		esac
+	done
+	for ci_i in $ci_items ; do
+		case "$ci_i" in
+			model:*) dl_model "${ci_i#model:}" ;;
+		esac
+	done
+	cmd_refresh
+	for ci_i in $ci_items ; do
+		case "$ci_i" in
+			eng:*)
+				ci_p="${ci_i#eng:}"
+				if [ -n "$(installed_ids "$ci_p")" ] ; then
+					svc_start "$ci_p" || warn "install:$ci_p: service did not start (exit $?)"
+				else
+					warn "install:$ci_p: no model installed yet, service not started"
+				fi
+				;;
+		esac
+	done
+	cmd_refresh
+}
+
+cmd_uninstall() {
+	cu_purge=0
+	cu_dry=0
+	cu_tokens=
+	for cu_a in "$@" ; do
+		case "$cu_a" in
+			--purge) cu_purge=1 ;;
+			--dry-run|--parse) cu_dry=1 ;;
+			-*) die "uninstall: unknown option $cu_a" ;;
+			all) cu_tokens="$cu_tokens stt chat-engine all-chat-models" ;;
+			*) cu_tokens="$cu_tokens $cu_a" ;;
+		esac
+	done
+	[ -n "$cu_tokens" ] || [ "$cu_purge" = 1 ] || die "uninstall: name a part: stt, chat-engine, chat, all, or a model id"
+	if [ "$cu_dry" = 1 ] ; then
+		# shellcheck disable=SC2086
+		plan_uninstall $cu_tokens
+		return 0
+	fi
+	for cu_t in $cu_tokens ; do
+		case "$cu_t" in
+			stt)
+				svc_remove stt
+				if engine_present stt ; then pkg_del stt || warn "uninstall:stt: package removal failed (exit $?)" ; fi
+				cu_models=$(mf_ids stt)
+				;;
+			chat-engine)
+				svc_remove chat
+				if engine_present chat ; then pkg_del chat || warn "uninstall:chat-engine: package removal failed (exit $?)" ; fi
+				cu_models=
+				;;
+			chat|all-chat-models)
+				[ "$cu_t" = chat ] && { svc_remove chat ; if engine_present chat ; then pkg_del chat || warn "uninstall:chat: package removal failed (exit $?)" ; fi ; }
+				cu_models=$(mf_ids chat)
+				;;
+			*)
+				[ -n "$(mf_field "$cu_t" 2)" ] || die "uninstall: unknown part or model $cu_t"
+				cu_models="$cu_t"
+				;;
+		esac
+		for cu_id in $cu_models ; do
+			cu_path=$(model_path "$cu_id")
+			if [ -f "$cu_path" ] || [ -f "$cu_path.part" ] || [ -f "$LAI_DATA/state/$cu_id.ok" ] ; then
+				rm -f "$cu_path" "$cu_path.part" "$LAI_DATA/state/$cu_id.ok"
+				say "uninstall:$cu_id: removed"
+			fi
+		done
+	done
+	if [ "$cu_purge" = 1 ] ; then
+		svc_remove chat
+		svc_remove stt
+		rm -rf "$LAI_DATA"
+		say "uninstall: purged $LAI_DATA"
+		return 0
+	fi
+	[ -d "$LAI_DATA" ] && cmd_refresh
+	return 0
+}
+
+#
+# list, parts
+#
+
+cmd_parts() {
+	cat <<- EOF
+		stt           whisper.cpp package, its service, and the default speech model
+		stt-engine    whisper.cpp package and its service (no model)
+		chat-engine   llama.cpp package and its service (no model)
+		chat          chat-engine plus the default chat model of the configured profile
+		<model-id>    one model file (see: list --available)
+		all           stt, chat-engine and every chat model (uninstall only)
+	EOF
+}
+
+cmd_list() {
+	case "${1:-}" in
+		--json) cmd_refresh ; cat "$LAI_DATA/models.json" ;;
+		--available)
+			mf | awk -F'\t' '{printf "%-28s %-5s %-6s %10d  %s\n", $1, $2, $5, $8, $6}'
+			;;
+		"")
+			for cl_id in $(installed_ids) ; do
+				printf '%-28s %-5s %10s  %s\n' "$cl_id" "$(mf_field "$cl_id" 2)" "$(human "$(mf_field "$cl_id" 8)")" "$(model_path "$cl_id")"
+			done
+			;;
+		*) die "list: unknown option $1" ;;
+	esac
+}
+
+#
+# check
+#
+
+wav_silence() {
+	# one second, 16 kHz, mono, 16 bit, silence
+	printf 'RIFF\044\175\000\000WAVEfmt \020\000\000\000\001\000\001\000\200\076\000\000\000\175\000\000\002\000\020\000data\000\175\000\000' > "$1"
+	head -c 32000 /dev/zero >> "$1"
+}
+
+check_part() {
+	cp_part="$1"
+	cp_run="$2"
+	cp_bad=0
+	printf '== %s\n' "$cp_part"
+	if ! engine_present "$cp_part" ; then
+		printf '  engine:   not installed\n'
+		return 0
+	fi
+	printf '  engine:   %s\n' "$(command -v "$(engine_bin "$cp_part")")"
+	if [ "$LAI_OS" = FreeBSD ] ; then
+		printf '  package:  %s\n' "$(pkg query '%n-%v' "$(pkg_name "$cp_part")" 2>/dev/null || echo unknown)"
+	fi
+	cp_n=0
+	for cp_id in $(installed_ids "$cp_part") ; do
+		cp_n=$((cp_n + 1))
+		cp_have=$(wc -c < "$(model_path "$cp_id")" | tr -d ' ')
+		if [ "$cp_have" = "$(mf_field "$cp_id" 8)" ] ; then cp_ok=size-ok ; else cp_ok=SIZE-MISMATCH ; cp_bad=1 ; fi
+		printf '  model:    %s  %s  %s\n' "$cp_id" "$(human "$cp_have")" "$cp_ok"
+	done
+	[ "$cp_n" -gt 0 ] || { printf '  model:    none installed\n' ; return 0 ; }
+	if [ "$(part_state "$cp_part")" = running ] ; then
+		printf '  endpoint: up\n'
+	else
+		printf '  endpoint: DOWN\n'
+		return 1
+	fi
+	if [ "$cp_run" = 1 ] ; then
+		if "run_$cp_part" ; then printf '  run test: ok\n' ; else printf '  run test: FAILED\n' ; cp_bad=1 ; fi
+	fi
+	return "$cp_bad"
+}
+
+run_chat() {
+	rc_id=$(installed_ids chat | head -n 1)
+	curl -fsS --max-time 180 -H 'Content-Type: application/json' \
+		-d "{\"model\":\"$rc_id\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with the single word: ok\"}],\"max_tokens\":8}" \
+		"http://$LAI_CHAT_ADDR/v1/chat/completions" 2>/dev/null | grep -q '"choices"'
+}
+
+run_stt() {
+	rs_wav="$LAI_DATA/run/probe.wav"
+	wav_silence "$rs_wav"
+	curl -fsS --max-time 120 -F "file=@$rs_wav" -F response_format=json "http://$LAI_STT_ADDR/inference" 2>/dev/null | grep -q '"text"'
+	rs_rc=$?
+	rm -f "$rs_wav"
+	return "$rs_rc"
+}
+
+# check_parse <run>: the check as key: value lines on standard output, for tooling (the human report is the same facts). The first line is
+#   local-ai: installed | not installed | broken
+# then host.*, setup, disk_bytes, engine.<stt|chat>.{state,path}, and for every model of the manifest part.<id>.{part,state,disk_bytes,expected_bytes,memory_bytes,running}
+# and part.<id>.why for a broken one. Exit 1 as the human check does: a model of the wrong size, a missing or unmarked file, an installed part that does not run.
+check_parse() {
+	cq_run="$1"
+	cq_rc=0
+	cq_broken=0
+	cq_any=0
+	conf_load
+	cq_stt_state=$(part_state stt)
+	cq_chat_state=$(part_state chat)
+	engine_present stt && cq_any=1
+	engine_present chat && cq_any=1
+	for cq_id in $(mf_ids) ; do
+		case "$(model_state "$cq_id")" in
+			broken\|*) cq_broken=1 ; cq_rc=1 ;;
+			installed) cq_any=1 ;;
+		esac
+	done
+	if [ "$cq_broken" = 1 ] ; then kv local-ai broken ; elif [ "$cq_any" = 1 ] ; then kv local-ai installed ; else kv local-ai "not installed" ; fi
+	kv host.os "$LAI_OS"
+	kv host.cpus "$(host_cpus)"
+	kv host.ram_bytes "$(host_ram)"
+	kv host.data "$LAI_DATA"
+	kv host.free_bytes "$(host_free)"
+	kv host.profile "$LAI_PROFILE"
+	if [ -d "$LAI_DATA" ] ; then
+		kv setup yes
+		kv disk_bytes "$(du -sk "$LAI_DATA" 2>/dev/null | awk '{print $1 * 1024}')"
+	else
+		kv setup no
+		kv disk_bytes 0
+	fi
+	for cq_part in stt chat ; do
+		kv "engine.$cq_part.state" "$(part_state "$cq_part")"
+		if engine_present "$cq_part" ; then kv "engine.$cq_part.path" "$(command -v "$(engine_bin "$cq_part")")" ; else kv "engine.$cq_part.path" none ; fi
+	done
+	cq_stt_serving="${LAI_STT_MODEL:-$(installed_ids stt | head -n 1)}"
+	for cq_id in $(mf_ids) ; do
+		cq_p=$(mf_field "$cq_id" 2)
+		cq_st=$(model_state "$cq_id")
+		cq_why=
+		case "$cq_st" in broken\|*) cq_why="${cq_st#broken|}" ; cq_st=broken ;; esac
+		cq_disk=0
+		[ -f "$(model_path "$cq_id")" ] && cq_disk=$(wc -c < "$(model_path "$cq_id")" | tr -d ' ')
+		cq_running=no
+		if [ "$cq_st" = installed ] ; then
+			case "$cq_p" in
+				chat) [ "$cq_chat_state" = running ] && cq_running=yes ;;
+				stt) [ "$cq_stt_state" = running ] && [ "$cq_id" = "$cq_stt_serving" ] && cq_running=yes ;;
+			esac
+			# an installed part whose engine is there and whose endpoint is down does not run
+			case "$cq_p:$cq_chat_state:$cq_stt_state" in
+				chat:stopped:*|stt:*:stopped) cq_rc=1 ;;
+			esac
+		fi
+		kv "part.$cq_id.part" "$cq_p"
+		kv "part.$cq_id.state" "$cq_st"
+		[ -z "$cq_why" ] || kv "part.$cq_id.why" "$cq_why"
+		kv "part.$cq_id.disk_bytes" "$cq_disk"
+		kv "part.$cq_id.expected_bytes" "$(mf_field "$cq_id" 8)"
+		kv "part.$cq_id.memory_bytes" "$(model_memory "$cq_id")"
+		kv "part.$cq_id.running" "$cq_running"
+	done
+	if [ "$cq_run" = 1 ] ; then
+		for cq_part in stt chat ; do
+			if [ -n "$(installed_ids "$cq_part")" ] && [ "$(part_state "$cq_part")" = running ] ; then
+				if "run_$cq_part" ; then kv "run.$cq_part" ok ; else kv "run.$cq_part" FAILED ; cq_rc=1 ; fi
+			fi
+		done
+	fi
+	return "$cq_rc"
+}
+
+cmd_check() {
+	cc_run=0
+	cc_verify=0
+	cc_parse=0
+	for cc_a in "$@" ; do
+		case "$cc_a" in
+			--run) cc_run=1 ;;
+			--verify) cc_verify=1 ;;
+			--parse) cc_parse=1 ;;
+			*) die "check: unknown option $cc_a" ;;
+		esac
+	done
+	if [ "$cc_parse" = 1 ] ; then
+		check_parse "$cc_run"
+		return $?
+	fi
+	conf_load
+	printf '== host\n'
+	printf '  os:       %s\n' "$LAI_OS"
+	printf '  cpus:     %s\n' "$(host_cpus)"
+	printf '  ram:      %s\n' "$(human "$(host_ram)")"
+	printf '  data:     %s (free %s)\n' "$LAI_DATA" "$(human "$(host_free)")"
+	printf '  profile:  %s\n' "$LAI_PROFILE"
+	if [ ! -d "$LAI_DATA" ] ; then
+		printf '  local AI is not set up on this host\n'
+		return 0
+	fi
+	printf '  on disk:  %s\n' "$(du -sk "$LAI_DATA" 2>/dev/null | awk '{printf "%.1f GB", $1/1048576}')"
+	cc_rc=0
+	check_part stt "$cc_run" || cc_rc=1
+	check_part chat "$cc_run" || cc_rc=1
+	if [ "$cc_verify" = 1 ] ; then
+		printf '== checksums\n'
+		for cc_id in $(installed_ids) ; do
+			if [ "$(sha256_of "$(model_path "$cc_id")")" = "$(mf_field "$cc_id" 9)" ] ; then
+				printf '  %s  ok\n' "$cc_id"
+			else
+				printf '  %s  MISMATCH\n' "$cc_id" ; cc_rc=1
+			fi
+		done
+	fi
+	[ -f "$LAI_DATA/models.json" ] && printf '== model list\n  %s\n' "$LAI_DATA/models.json"
+	return "$cc_rc"
+}
+
+#
+# ask, transcribe (one request to a running part; the answer is the server's own JSON, on standard output)
+#
+
+# json_string: standard input as one JSON string, quotes and escapes included
+json_string() {
+	awk 'BEGIN { ORS = "" ; printf "\"" }
+		{ line = $0 ; gsub(/\\/, "\\\\", line) ; gsub(/"/, "\\\"", line) ; gsub(/\t/, "\\t", line) ; gsub(/\r/, "\\r", line) ; if (NR > 1) printf "\\n" ; printf "%s", line }
+		END { printf "\"" }'
+}
+
+# ask <model-id> [max-tokens]: the prompt on standard input, to an installed chat model through the chat endpoint. The request body goes on
+# standard input of curl and never on its command line, which any user of the host can read.
+cmd_ask() {
+	ca_id="${1:-}"
+	[ -n "$ca_id" ] || die "ask: name an installed chat model"
+	[ "$(mf_field "$ca_id" 2)" = chat ] && is_installed "$ca_id" || die "ask: $ca_id is not an installed chat model"
+	conf_load
+	[ "$(part_state chat)" = running ] || die "ask: the chat endpoint $LAI_CHAT_ADDR does not answer (engine $(part_state chat))"
+	ca_prompt=$(cat)
+	[ -n "$ca_prompt" ] || die "ask: the prompt is empty"
+	{
+		printf '{"model":"%s","max_tokens":%s,"messages":[{"role":"user","content":' "$ca_id" "${2:-512}"
+		printf '%s' "$ca_prompt" | json_string
+		printf '}]}'
+	} | curl -fsS --max-time 300 -H 'Content-Type: application/json' --data-binary @- "http://$LAI_CHAT_ADDR/v1/chat/completions" || die "ask: the request to $LAI_CHAT_ADDR failed"
+	printf '\n'
+}
+
+# transcribe [<wav-file>]: a file to the speech endpoint; with none, the one second of silence the check uses
+cmd_transcribe() {
+	ct_wav="${1:-}"
+	ct_made=0
+	conf_load
+	[ "$(part_state stt)" = running ] || die "transcribe: the speech endpoint $LAI_STT_ADDR does not answer (engine $(part_state stt))"
+	if [ -z "$ct_wav" ] ; then
+		ct_wav="$LAI_DATA/run/probe.wav"
+		wav_silence "$ct_wav"
+		ct_made=1
+	fi
+	[ -f "$ct_wav" ] || die "transcribe: not a file: $ct_wav"
+	curl -fsS --max-time 120 -F "file=@$ct_wav" -F response_format=json "http://$LAI_STT_ADDR/inference"
+	ct_rc=$?
+	[ "$ct_made" = 0 ] || rm -f "$ct_wav"
+	[ "$ct_rc" = 0 ] || die "transcribe: the request to $LAI_STT_ADDR failed"
+	printf '\n'
+}
+
+#
+# serve (run by the rc scripts, or by hand on a host with no rc)
+#
+
+has_flag() {
+	"$1" --help 2>&1 | grep -q -e "$2"
+}
+
+host_of() { hof="${1%:*}" ; hof="${hof#[}" ; echo "${hof%]}" ; }
+port_of() { echo "${1##*:}" ; }
+
+cmd_serve() {
+	conf_load
+	case "${1:-}" in
+		chat)
+			engine_present chat || { warn "serve:chat: llama-server not installed" ; exit 78 ; }
+			sv_n=$(host_cpus)
+			case "$LAI_PROFILE" in
+				shared-cpu)
+					sv_t=$(( sv_n / 2 )) ; [ "$sv_t" -ge 1 ] || sv_t=1 ; [ "$sv_t" -le 4 ] || sv_t=4
+					sv_args="-t $sv_t -c 8192 -np 1 -ngl 0" ;;
+				big-cpu)
+					sv_t=$(( sv_n - 1 )) ; [ "$sv_t" -ge 1 ] || sv_t=1
+					sv_args="-t $sv_t -c 16384 -np 2 -ngl 0" ;;
+				gpu)
+					sv_args="-t 4 -c 32768 -np 2 -ngl 99" ;;
+			esac
+			has_flag llama-server "--cache-reuse" && sv_args="$sv_args --cache-reuse 256"
+			has_flag llama-server "--slot-save-path" && sv_args="$sv_args --slot-save-path $LAI_DATA/cache"
+			sv_first=$(installed_ids chat | head -n 1)
+			[ -n "$sv_first" ] || { warn "serve:chat: no chat model installed" ; exit 78 ; }
+			if has_flag llama-server "--models-preset" ; then
+				sv_model="--models-preset $LAI_DATA/models.ini"
+			else
+				sv_def=$(mf_default chat "$LAI_PROFILE")
+				if [ -n "$sv_def" ] && is_installed "$sv_def" ; then sv_first="$sv_def" ; fi
+				sv_model="-m $(model_path "$sv_first")"
+			fi
+			# shellcheck disable=SC2086
+			exec llama-server --host "$(host_of "$LAI_CHAT_ADDR")" --port "$(port_of "$LAI_CHAT_ADDR")" $sv_model $sv_args $LAI_CHAT_ARGS
+			;;
+		stt)
+			engine_present stt || { warn "serve:stt: whisper-server not installed" ; exit 78 ; }
+			sv_id="${LAI_STT_MODEL:-$(installed_ids stt | head -n 1)}"
+			[ -n "$sv_id" ] && is_installed "$sv_id" || { warn "serve:stt: no speech model installed" ; exit 78 ; }
+			sv_t=$(host_cpus) ; [ "$sv_t" -le 4 ] || sv_t=4
+			# shellcheck disable=SC2086
+			exec whisper-server --host "$(host_of "$LAI_STT_ADDR")" --port "$(port_of "$LAI_STT_ADDR")" -m "$(model_path "$sv_id")" -t "$sv_t" $LAI_STT_ARGS
+			;;
+		*) die "serve: chat or stt" ;;
+	esac
+}
+
+cmd_service() {
+	cs_verb="$1" ; shift
+	[ $# -gt 0 ] || set -- stt chat
+	for cs_p in "$@" ; do
+		case "$cs_p" in stt|chat) ;; *) die "$cs_verb: stt or chat" ;; esac
+		case "$cs_verb" in
+			start|restart) svc_start "$cs_p" ;;
+			stop) svc_stop "$cs_p" ;;
+			status) printf '%s: %s\n' "$cs_p" "$(part_state "$cs_p")" ;;
+		esac
+	done
+	[ "$cs_verb" = status ] || cmd_refresh
+}
+
+cmd_help() {
+	cat <<- EOF
+		syntax: mdci-local-ai <command> [arguments]
+
+		  parts                          the part names install and uninstall take
+		  list [--json|--available]      installed models; --json prints the model list file
+		  install [--dry-run] [--parse] [--force] <part|model-id>...
+		  uninstall [--purge] [--dry-run] <part|model-id>...
+		  check [--run] [--verify] [--parse]  what is installed, sizes, whether each part runs; --parse prints key: value lines
+		  ask <model-id> [max-tokens]    the prompt on standard input to an installed chat model; prints the server answer (JSON)
+		  transcribe [wav-file]          a file to the speech endpoint (none: one second of silence); prints the server answer (JSON)
+		  refresh                        rewrite models.json and models.ini
+		  start|stop|restart|status [stt|chat]
+		  serve <stt|chat>               run a server in the foreground (used by the rc scripts)
+		  setup                          create folders, user and config (install does it)
+
+		data: $LAI_DATA   model list: $LAI_DATA/models.json
+	EOF
+}
+
+LAI_FORCE=0
+lai_cmd="${1:-help}"
+[ $# -eq 0 ] || shift
+case "$lai_cmd" in
+	help|--help|-h) cmd_help ;;
+	parts) cmd_parts ;;
+	list) cmd_list "$@" ;;
+	install) cmd_install "$@" ;;
+	uninstall) cmd_uninstall "$@" ;;
+	check) cmd_check "$@" ;;
+	ask) cmd_ask "$@" ;;
+	transcribe) cmd_transcribe "$@" ;;
+	refresh) cmd_refresh ;;
+	setup) cmd_setup ;;
+	serve) cmd_serve "$@" ;;
+	start|stop|restart|status) cmd_service "$lai_cmd" "$@" ;;
+	*) die "unknown command $lai_cmd (try: help)" ;;
+esac

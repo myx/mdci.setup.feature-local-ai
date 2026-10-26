@@ -1,0 +1,7 @@
+# id	part	family	params	quant	profiles	file	size_bytes	sha256	url
+# profiles: comma list of shared-cpu, big-cpu, gpu (stt: all); a trailing * marks the default of that profile
+# sha256 and size_bytes are the Hugging Face LFS values read on 2026-10-26; refresh both when a row changes
+stt-whisper-large-v3-turbo-q5_0	stt	whisper	large-v3-turbo	q5_0	all*	ggml-large-v3-turbo-q5_0.bin	574041195	394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2	https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin
+qwen3.5-4b-q8_0	chat	qwen3.5	4B	q8_0	shared-cpu*	Qwen3.5-4B-Q8_0.gguf	4482403488	10cc391b403021dd11c614679d2fd92f611c3681d29e29651b717316965d61e1	https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q8_0.gguf
+qwen3.5-9b-q8_0	chat	qwen3.5	9B	q8_0	big-cpu*	Qwen3.5-9B-Q8_0.gguf	9527502048	809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4	https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf
+qwen3.8-27b-q8_0	chat	qwen3.8	27B	q8_0	gpu*	Qwen3.8-27B-Q8_0.gguf	29047086048	a680f44a06920e5d689774823782006aa3acc8db95750323373b24139b67e348	https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/main/Qwen3.8-27B-Q8_0.gguf

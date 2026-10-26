@@ -1,0 +1,21 @@
+#!/bin/sh
+
+# Sets up the data folder, the service user, the config and the mdci-local-ai command,
+# then installs the parts named in MDCI_LOCAL_AI_PARTS (space separated: stt, chat-engine,
+# chat, or model ids). With the list empty nothing is installed or downloaded.
+
+LOCAL_AI_TOOL="${MDCI_FILES_PATH:-/usr/local/mdci-files}/local-ai/mdci-local-ai"
+
+[ -x "${LOCAL_AI_TOOL}" ] || { echo "⛔ ERROR: local-ai:install: ${LOCAL_AI_TOOL} is not deployed" >&2 ; exit 1 ; }
+
+"${LOCAL_AI_TOOL}" setup || { echo "⛔ ERROR: local-ai:install: setup failed (exit $?)" >&2 ; exit 1 ; }
+
+[ -n "${MDCI_LOCAL_AI_PARTS:-}" ] || { echo "local-ai:install: MDCI_LOCAL_AI_PARTS is empty, no part installed" >&2 ; exit 0 ; }
+
+echo "local-ai:install: installing ${MDCI_LOCAL_AI_PARTS}" >&2
+
+# a failed package or download leaves the deploy going; the check step names what is missing
+# shellcheck disable=SC2086
+"${LOCAL_AI_TOOL}" install ${MDCI_LOCAL_AI_PARTS} || echo "🙋 WARNING: local-ai:install: some parts of ${MDCI_LOCAL_AI_PARTS} are not installed (exit $?)" >&2
+
+exit 0

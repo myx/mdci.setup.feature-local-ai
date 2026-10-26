@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# PROVIDE: mdci_ai_chat
+# REQUIRE: LOGIN DAEMON FILESYSTEMS NETWORKING
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="mdci_ai_chat"
+rcvar="mdci_ai_chat_enable"
+
+mdci_ai_chat_enable="${mdci_ai_chat_enable:-"NO"}"
+mdci_ai_chat_user="${mdci_ai_chat_user:-"mdci-ai"}"
+
+load_rc_config $name
+
+pidfile="/var/run/${name}.pid"
+command="/usr/sbin/daemon"
+command_args="-P ${pidfile} -R 10 -f -S -T ${name} -u ${mdci_ai_chat_user} /usr/local/sbin/mdci-local-ai serve chat"
+
+required_files="/var/db/mdci-local-ai/local-ai.conf"
+
+run_rc_command "$1"

@@ -1,0 +1,17 @@
+#!/bin/sh
+
+# Removes the parts named in MDCI_LOCAL_AI_REMOVE (space separated: stt, chat-engine,
+# chat, all, or model ids). Nothing is ever removed unless named here.
+
+LOCAL_AI_TOOL="${MDCI_FILES_PATH:-/usr/local/mdci-files}/local-ai/mdci-local-ai"
+
+[ -n "${MDCI_LOCAL_AI_REMOVE:-}" ] || exit 0
+
+[ -x "${LOCAL_AI_TOOL}" ] || { echo "⛔ ERROR: local-ai:uninstall: ${LOCAL_AI_TOOL} is not deployed" >&2 ; exit 1 ; }
+
+echo "local-ai:uninstall: removing ${MDCI_LOCAL_AI_REMOVE}" >&2
+
+# shellcheck disable=SC2086
+"${LOCAL_AI_TOOL}" uninstall ${MDCI_LOCAL_AI_REMOVE} || echo "🙋 WARNING: local-ai:uninstall: removal of ${MDCI_LOCAL_AI_REMOVE} was incomplete (exit $?)" >&2
+
+exit 0

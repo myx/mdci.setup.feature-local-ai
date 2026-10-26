@@ -1,0 +1,23 @@
+#!/bin/sh
+
+# Reports what is installed, the sizes, and whether each part runs. Never stops the deploy.
+#
+# With MDCI_CHECK_PARSE=1 it prints the same facts as `key: value` lines on standard output, the first `local-ai: installed | not installed | broken`
+# (the keys are those of `mdci-local-ai check --parse`), and ends with the status of that check: 0, or 1 where a model is broken or an installed part does not run.
+# The human report below is unchanged and is what a deploy prints.
+
+LOCAL_AI_TOOL="${MDCI_FILES_PATH:-/usr/local/mdci-files}/local-ai/mdci-local-ai"
+
+if [ "${MDCI_CHECK_PARSE:-}" = "1" ] ; then
+	[ -x "${LOCAL_AI_TOOL}" ] || { echo "🙋 WARNING: local-ai:check: ${LOCAL_AI_TOOL} is not deployed" >&2 ; echo "local-ai: not installed" ; exit 1 ; }
+	"${LOCAL_AI_TOOL}" check --parse
+	exit $?
+fi
+
+[ -x "${LOCAL_AI_TOOL}" ] || { echo "🙋 WARNING: local-ai:check: ${LOCAL_AI_TOOL} is not deployed" >&2 ; exit 0 ; }
+
+echo "local-ai:check: report" >&2
+
+"${LOCAL_AI_TOOL}" check >&2 || echo "🙋 WARNING: local-ai:check: an installed part does not run (exit $?), see the report above" >&2
+
+exit 0
