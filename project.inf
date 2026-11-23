@@ -1,5 +1,8 @@
 Name: setup.feature-local-ai
 Info: optional local AI on a machine: speech-to-text (whisper.cpp) and chat models (llama.cpp), each part installed and removed on its own
+Declares: \
+	mdci-installable:feature:setup.feature-local-ai \
+
 Requires: \
 	
 
